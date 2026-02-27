@@ -126,21 +126,12 @@ Three languages appear in adapter configs, each for a different purpose:
 ### File skeleton
 
 ```yaml
-apiVersion: hyperfleet.redhat.com/v1alpha1
-kind: AdapterTaskConfig
-metadata:
-  name: my-adapter          # Unique adapter name (used in status reports and logs)
-  labels:
-    hyperfleet.io/adapter-type: my-adapter
-    hyperfleet.io/component: adapter
-
-spec:
-  params: []            # Phase 1: Extract variables from event and environment
-  preconditions: []     # Phase 2: Validate state via API calls
-  resources: []         # Phase 3: Create/update Kubernetes resources
-  post:                 # Phase 4: Report status
-    payloads: []        #   Build status JSON
-    postActions: []     #   Send status to API
+params: []            # Phase 1: Extract variables from event and environment
+preconditions: []     # Phase 2: Validate state via API calls
+resources: []         # Phase 3: Create/update Kubernetes resources
+post:                 # Phase 4: Report status
+  payloads: []        #   Build status JSON
+  post_actions: []    #   Send status to API
 ```
 
 ### Execution flow and error handling
@@ -181,24 +172,23 @@ The `adapter.*` context is populated automatically and available in your post-ac
 Parameters are variables extracted from the incoming CloudEvent and the runtime environment. They become available as Go Template variables (`{{ .paramName }}`) and CEL variables throughout the rest of the config.
 
 ```yaml
-spec:
-  params:
-    # From the CloudEvent data
-    - name: "clusterId"
-      source: "event.id"
-      type: "string"
-      required: true
+params:
+  # From the CloudEvent data
+  - name: "clusterId"
+    source: "event.id"
+    type: "string"
+    required: true
 
-    - name: "generation"
-      source: "event.generation"
-      type: "int"
-      required: true
+  - name: "generation"
+    source: "event.generation"
+    type: "int"
+    required: true
 
-    # From environment variables (set in Helm values or deployment)
-    - name: "region"
-      source: "env.REGION"
-      type: "string"
-      default: "us-east-1"
+  # From environment variables (set in Helm values or deployment)
+  - name: "region"
+    source: "env.REGION"
+    type: "string"
+    default: "us-east-1"
 ```
 
 ### Sources
@@ -242,15 +232,15 @@ The state of the cluster contains information about all adapters in the form of 
 ```yaml
 preconditions:
   - name: "clusterStatus"
-    apiCall:
+    api_call:
       method: "GET"
       url: "/api/hyperfleet/v1/clusters/{{ .clusterId }}"
       timeout: 10s
-      retryAttempts: 3
-      retryBackoff: "exponential"    # also: linear, constant
+      retry_attempts: 3
+      retry_backoff: "exponential"    # also: linear, constant
 ```
 
-URLs are **relative** — the base URL comes from the `AdapterConfig` `clients.hyperfleetApi.baseUrl` setting. You only write the path.
+URLs are **relative** — the base URL comes from the `AdapterConfig` `clients.hyperfleet_api.base_url` setting. You only write the path.
 
 ### Capturing fields
 
@@ -321,14 +311,14 @@ Preconditions execute in order. Data flows forward — a captured field from pre
 ```yaml
 preconditions:
   - name: "getCluster"
-    apiCall:
+    api_call:
       url: "/api/hyperfleet/v1/clusters/{{ .clusterId }}"
     capture:
       - name: "clusterName"
         field: "name"
 
   - name: "getStatuses"
-    apiCall:
+    api_call:
       url: "/api/hyperfleet/v1/clusters/{{ .clusterId }}/statuses"
     capture:
       - name: "lzReady"
@@ -361,7 +351,7 @@ resources:
         name: "{{ .clusterId | lower }}"
         labels:
           hyperfleet.io/cluster-id: "{{ .clusterId }}"
-          hyperfleet.io/managed-by: "{{ .metadata.name }}"
+          hyperfleet.io/managed-by: "{{ .adapter.name }}"
           hyperfleet.io/resource-type: "namespace"
         annotations:
           hyperfleet.io/generation: "{{ .generation }}"
@@ -416,7 +406,7 @@ discovery:
 
 # By label selector
 discovery:
-  namespace: "{{ .clusterId }}"       # omit for all namespaces / cluster-scoped
+  namespace: "{{ .clusterId }}"       # omit or "*" for cluster-scoped
   bySelectors:
     labelSelector:
       hyperfleet.io/cluster-id: "{{ .clusterId }}"
@@ -721,7 +711,7 @@ post:
   payloads:
     - name: "statusPayload"
       build:
-        adapter: "{{ .metadata.name }}"
+        adapter: "{{ .adapter.name }}"
         conditions:
           - type: "Applied"
             status:
@@ -1137,24 +1127,20 @@ The adapter will run preconditions, skip straight to post-actions, and report st
 <details><summary>Example minimal adapter-config</summary>
 
 ```yaml
-apiVersion: hyperfleet.redhat.com/v1alpha1
-kind: AdapterConfig
-metadata:
+adapter:
   name: my-adapter
-spec:
-  adapter:
-    version: "0.1.0"
-  clients:
-    hyperfleetApi:
-      baseUrl: "http://hyperfleet-api:8000"
-      timeout: 10s
-      retryAttempts: 3
-      retryBackoff: exponential
-    broker:
-      subscriptionId: "my-adapter-sub"
-      topic: "cluster-events"
-    kubernetes:
-      apiVersion: "v1"
+  version: "0.1.0"
+clients:
+  hyperfleet_api:
+    base_url: "http://hyperfleet-api:8000"
+    timeout: 10s
+    retry_attempts: 3
+    retry_backoff: exponential
+  broker:
+    subscription_id: "my-adapter-sub"
+    topic: "cluster-events"
+  kubernetes:
+    api_version: "v1"
 ```
 
 </details>
@@ -1254,7 +1240,7 @@ has(resources.namespace0) && has(resources.configmap0)
 {{ .variableName }}                              Variable interpolation
 {{ .clusterId | lower }}                         Lowercase filter
 {{ now | date "2006-01-02T15:04:05Z07:00" }}     Current timestamp (RFC 3339)
-{{ .metadata.name }}                             Adapter name from config metadata
+{{ .adapter.name }}                              Adapter name from config
 ```
 
 Go Templates are used in: URLs, manifest field values, direct string values in payloads, and external template files.

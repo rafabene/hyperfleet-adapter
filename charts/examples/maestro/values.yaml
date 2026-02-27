@@ -13,7 +13,7 @@ broker:
   create: true
   googlepubsub:
     projectId: CHANGE_ME
-    subscriptionId: CHANGE_ME
+    subscription_id: CHANGE_ME
     topic: CHANGE_ME
     deadLetterTopic: CHANGE_ME
 

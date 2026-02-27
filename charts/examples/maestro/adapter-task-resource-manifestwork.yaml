@@ -78,7 +78,7 @@ spec:
         name: "{{ .clusterId | lower }}"
         labels:
           hyperfleet.io/cluster-id: "{{ .clusterId }}"
-          hyperfleet.io/managed-by: "{{ .metadata.name }}"
+          hyperfleet.io/managed-by: "{{ .adapter.name }}"
           hyperfleet.io/resource-type: "namespace"
         annotations:
           hyperfleet.io/created-by: "hyperfleet-adapter"
