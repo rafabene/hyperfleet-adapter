@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/cloudevents/sdk-go/v2/event"
@@ -10,6 +11,9 @@ import (
 	"github.com/openshift-hyperfleet/hyperfleet-adapter/internal/hyperfleet_api"
 	"github.com/openshift-hyperfleet/hyperfleet-adapter/internal/k8s_client"
 	"github.com/openshift-hyperfleet/hyperfleet-adapter/pkg/logger"
+	"github.com/openshift-hyperfleet/hyperfleet-adapter/pkg/metrics"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -778,4 +782,176 @@ func TestSequentialExecution_SkipReasonCapture(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestCreateHandler_MetricsRecording verifies that CreateHandler records Prometheus metrics
+func TestCreateHandler_MetricsRecording(t *testing.T) {
+	tests := []struct {
+		name           string
+		preconditions  []config_loader.Precondition
+		expectedStatus string // "success", "skipped", or "failed"
+		expectedErrors []string
+	}{
+		{
+			name:           "success records success metric",
+			preconditions:  []config_loader.Precondition{},
+			expectedStatus: "success",
+		},
+		{
+			name: "skipped records skipped metric",
+			preconditions: []config_loader.Precondition{
+				{ActionBase: config_loader.ActionBase{Name: "check"}, Expression: "false"},
+			},
+			expectedStatus: "skipped",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			registry := prometheus.NewRegistry()
+			recorder := metrics.NewRecorder("test-adapter", "v0.1.0", registry)
+
+			config := &config_loader.Config{
+				Metadata: config_loader.Metadata{Name: "test-adapter"},
+				Spec:     config_loader.ConfigSpec{Preconditions: tt.preconditions},
+			}
+
+			exec, err := NewBuilder().
+				WithConfig(config).
+				WithAPIClient(newMockAPIClient()).
+				WithTransportClient(k8s_client.NewMockK8sClient()).
+				WithLogger(logger.NewTestLogger()).
+				WithMetricsRecorder(recorder).
+				Build()
+			require.NoError(t, err)
+
+			handler := exec.CreateHandler()
+
+			evt := event.New()
+			evt.SetID("test-event-1")
+			evt.SetType("com.hyperfleet.test")
+			evt.SetSource("test")
+			eventData := map[string]interface{}{"id": "cluster-1"}
+			eventBytes, _ := json.Marshal(eventData)
+			_ = evt.SetData(event.ApplicationJSON, eventBytes)
+
+			err = handler(context.Background(), &evt)
+			require.NoError(t, err, "handler should always return nil")
+
+			// Verify events_processed_total
+			families, err := registry.Gather()
+			require.NoError(t, err)
+
+			eventsCount := getCounterValue(t, families, "hyperfleet_adapter_events_processed_total", "status", tt.expectedStatus)
+			assert.Equal(t, float64(1), eventsCount, "expected 1 event with status %s", tt.expectedStatus)
+
+			// Verify duration was recorded
+			durationFamily := findFamily(families, "hyperfleet_adapter_event_processing_duration_seconds")
+			require.NotNil(t, durationFamily, "duration metric should exist")
+			histogram := durationFamily.GetMetric()[0].GetHistogram()
+			assert.Equal(t, uint64(1), histogram.GetSampleCount(), "expected 1 duration sample")
+		})
+	}
+}
+
+// TestCreateHandler_MetricsRecording_Failed verifies error metrics are recorded on failure
+func TestCreateHandler_MetricsRecording_Failed(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	recorder := metrics.NewRecorder("test-adapter", "v0.1.0", registry)
+
+	config := &config_loader.Config{
+		Metadata: config_loader.Metadata{Name: "test-adapter"},
+		Spec: config_loader.ConfigSpec{
+			Params: []config_loader.Parameter{
+				{Name: "required", Source: "env.MISSING_VAR", Required: true},
+			},
+		},
+	}
+
+	exec, err := NewBuilder().
+		WithConfig(config).
+		WithAPIClient(newMockAPIClient()).
+		WithTransportClient(k8s_client.NewMockK8sClient()).
+		WithLogger(logger.NewTestLogger()).
+		WithMetricsRecorder(recorder).
+		Build()
+	require.NoError(t, err)
+
+	handler := exec.CreateHandler()
+
+	evt := event.New()
+	evt.SetID("test-event-fail")
+	evt.SetType("com.hyperfleet.test")
+	evt.SetSource("test")
+	eventData := map[string]interface{}{"id": "cluster-1"}
+	eventBytes, _ := json.Marshal(eventData)
+	_ = evt.SetData(event.ApplicationJSON, eventBytes)
+
+	err = handler(context.Background(), &evt)
+	require.NoError(t, err, "handler should always return nil even on failure")
+
+	families, err := registry.Gather()
+	require.NoError(t, err)
+
+	// Verify failed event was recorded
+	failedCount := getCounterValue(t, families, "hyperfleet_adapter_events_processed_total", "status", "failed")
+	assert.Equal(t, float64(1), failedCount, "expected 1 failed event")
+
+	// Verify error was recorded with phase label
+	errorCount := getCounterValue(t, families, "hyperfleet_adapter_errors_total", "error_type", "param_extraction")
+	assert.Equal(t, float64(1), errorCount, "expected 1 param_extraction error")
+}
+
+// TestCreateHandler_NilMetricsRecorder verifies handler works without a metrics recorder
+func TestCreateHandler_NilMetricsRecorder(t *testing.T) {
+	config := &config_loader.Config{
+		Metadata: config_loader.Metadata{Name: "test-adapter"},
+	}
+
+	exec, err := NewBuilder().
+		WithConfig(config).
+		WithAPIClient(newMockAPIClient()).
+		WithTransportClient(k8s_client.NewMockK8sClient()).
+		WithLogger(logger.NewTestLogger()).
+		Build()
+	require.NoError(t, err)
+
+	handler := exec.CreateHandler()
+
+	evt := event.New()
+	evt.SetID("test-event-nil")
+	evt.SetType("com.hyperfleet.test")
+	evt.SetSource("test")
+	_ = evt.SetData(event.ApplicationJSON, []byte(`{"id":"cluster-1"}`))
+
+	assert.NotPanics(t, func() {
+		_ = handler(context.Background(), &evt)
+	}, "handler with nil MetricsRecorder should not panic")
+}
+
+// helper functions for metrics assertions
+
+func findFamily(families []*dto.MetricFamily, name string) *dto.MetricFamily {
+	for _, f := range families {
+		if f.GetName() == name {
+			return f
+		}
+	}
+	return nil
+}
+
+func getCounterValue(t *testing.T, families []*dto.MetricFamily, metricName, labelName, labelValue string) float64 {
+	t.Helper()
+	family := findFamily(families, metricName)
+	if family == nil {
+		t.Fatalf("metric %s not found", metricName)
+	}
+	for _, m := range family.GetMetric() {
+		for _, l := range m.GetLabel() {
+			if l.GetName() == labelName && l.GetValue() == labelValue {
+				return m.GetCounter().GetValue()
+			}
+		}
+	}
+	return 0
 }

@@ -11,6 +11,7 @@ import (
 	"github.com/openshift-hyperfleet/hyperfleet-adapter/internal/manifest"
 	"github.com/openshift-hyperfleet/hyperfleet-adapter/internal/transport_client"
 	"github.com/openshift-hyperfleet/hyperfleet-adapter/pkg/logger"
+	"github.com/openshift-hyperfleet/hyperfleet-adapter/pkg/metrics"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
@@ -64,6 +65,8 @@ type ExecutorConfig struct {
 	TransportClient transport_client.TransportClient
 	// Logger is the logger instance
 	Logger logger.Logger
+	// MetricsRecorder records adapter-level Prometheus metrics (nil disables recording)
+	MetricsRecorder *metrics.Recorder
 }
 
 // Executor processes CloudEvents according to the adapter configuration

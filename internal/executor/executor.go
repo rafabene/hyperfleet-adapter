@@ -7,11 +7,14 @@ import (
 	"reflect"
 	"strings"
 
+	"time"
+
 	"github.com/cloudevents/sdk-go/v2/event"
 	"github.com/openshift-hyperfleet/hyperfleet-adapter/internal/config_loader"
 	"github.com/openshift-hyperfleet/hyperfleet-adapter/internal/hyperfleet_api"
 	"github.com/openshift-hyperfleet/hyperfleet-adapter/internal/transport_client"
 	"github.com/openshift-hyperfleet/hyperfleet-adapter/pkg/logger"
+	"github.com/openshift-hyperfleet/hyperfleet-adapter/pkg/metrics"
 	pkgotel "github.com/openshift-hyperfleet/hyperfleet-adapter/pkg/otel"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/trace"
@@ -256,12 +259,38 @@ func (e *Executor) CreateHandler() func(ctx context.Context, evt *event.Event) e
 		e.log.Infof(ctx, "Event received: id=%s type=%s source=%s time=%s",
 			evt.ID(), evt.Type(), evt.Source(), evt.Time())
 
-		_ = e.Execute(ctx, evt.Data())
+		start := time.Now()
+		result := e.Execute(ctx, evt.Data())
+		duration := time.Since(start)
+
+		e.recordMetrics(result, duration)
 
 		e.log.Infof(ctx, "Event processed: type=%s source=%s time=%s",
 			evt.Type(), evt.Source(), evt.Time())
 
 		return nil
+	}
+}
+
+// recordMetrics records Prometheus metrics based on the execution result.
+func (e *Executor) recordMetrics(result *ExecutionResult, duration time.Duration) {
+	recorder := e.config.MetricsRecorder
+	if recorder == nil {
+		return
+	}
+
+	recorder.ObserveProcessingDuration(duration)
+
+	switch {
+	case result.Status == StatusFailed:
+		recorder.RecordEventProcessed("failed")
+		for phase := range result.Errors {
+			recorder.RecordError(string(phase))
+		}
+	case result.ResourcesSkipped:
+		recorder.RecordEventProcessed("skipped")
+	default:
+		recorder.RecordEventProcessed("success")
 	}
 }
 
@@ -344,6 +373,12 @@ func (b *ExecutorBuilder) WithTransportClient(client transport_client.TransportC
 // WithLogger sets the logger
 func (b *ExecutorBuilder) WithLogger(log logger.Logger) *ExecutorBuilder {
 	b.config.Logger = log
+	return b
+}
+
+// WithMetricsRecorder sets the Prometheus metrics recorder
+func (b *ExecutorBuilder) WithMetricsRecorder(recorder *metrics.Recorder) *ExecutorBuilder {
+	b.config.MetricsRecorder = recorder
 	return b
 }
 

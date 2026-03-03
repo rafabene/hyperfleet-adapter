@@ -18,6 +18,7 @@ import (
 	"github.com/openshift-hyperfleet/hyperfleet-adapter/internal/transport_client"
 	"github.com/openshift-hyperfleet/hyperfleet-adapter/pkg/health"
 	"github.com/openshift-hyperfleet/hyperfleet-adapter/pkg/logger"
+	"github.com/openshift-hyperfleet/hyperfleet-adapter/pkg/metrics"
 	"github.com/openshift-hyperfleet/hyperfleet-adapter/pkg/otel"
 	"github.com/openshift-hyperfleet/hyperfleet-adapter/pkg/version"
 	"github.com/openshift-hyperfleet/hyperfleet-broker/broker"
@@ -334,12 +335,13 @@ func createMaestroClient(ctx context.Context, maestroConfig *config_loader.Maest
 }
 
 // buildExecutor creates the executor with the given clients.
-func buildExecutor(config *config_loader.Config, apiClient hyperfleet_api.Client, tc transport_client.TransportClient, log logger.Logger) (*executor.Executor, error) {
+func buildExecutor(config *config_loader.Config, apiClient hyperfleet_api.Client, tc transport_client.TransportClient, log logger.Logger, recorder *metrics.Recorder) (*executor.Executor, error) {
 	return executor.NewBuilder().
 		WithConfig(config).
 		WithAPIClient(apiClient).
 		WithTransportClient(tc).
 		WithLogger(log).
+		WithMetricsRecorder(recorder).
 		Build()
 }
 
@@ -442,6 +444,9 @@ func runServe() error {
 		}
 	}()
 
+	// Create adapter metrics recorder
+	metricsRecorder := metrics.NewRecorder(config.Metadata.Name, version.Version, nil)
+
 	// Create real clients
 	log.Info(ctx, "Creating HyperFleet API client...")
 	apiClient, err := createAPIClient(config.Spec.Clients.HyperfleetAPI, log)
@@ -460,7 +465,7 @@ func runServe() error {
 
 	// Build executor
 	log.Info(ctx, "Creating event executor...")
-	exec, err := buildExecutor(config, apiClient, tc, log)
+	exec, err := buildExecutor(config, apiClient, tc, log, metricsRecorder)
 	if err != nil {
 		errCtx := logger.WithErrorField(ctx, err)
 		log.Errorf(errCtx, "Failed to create executor")
@@ -643,8 +648,8 @@ func runDryRun() error {
 		dryrunClient = dryrun.NewDryrunTransportClient()
 	}
 
-	// Build executor with mock clients (same builder as serve)
-	exec, err := buildExecutor(config, dryrunAPI, dryrunClient, log)
+	// Build executor with mock clients (same builder as serve, no metrics in dry-run)
+	exec, err := buildExecutor(config, dryrunAPI, dryrunClient, log, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create executor: %w", err)
 	}
