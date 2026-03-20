@@ -423,6 +423,8 @@ preconditions:
 
 Resources define the Kubernetes objects your adapter creates on the management cluster. They execute **sequentially** in the order listed — a namespace defined first is available for resources defined after it.
 
+**Important**: Include an annotation `hyperfleet.io/generation: {{ .generation }}` to the kubernetes resources to create. This will be used by adapters to know if the object is in current generation or must be updated.
+
 ### Inline manifests
 
 ```yaml
