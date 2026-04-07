@@ -814,7 +814,7 @@ func TestSequentialExecution_SkipReasonCapture(t *testing.T) {
 	}
 }
 
-// TestCreateHandler_MetricsRecording verifies that CreateHandler records Prometheus metrics
+// TestCreateHandler_MetricsRecording verifies that WithMetrics records Prometheus metrics
 func TestCreateHandler_MetricsRecording(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -851,11 +851,10 @@ func TestCreateHandler_MetricsRecording(t *testing.T) {
 				WithAPIClient(newMockAPIClient()).
 				WithTransportClient(k8sclient.NewMockK8sClient()).
 				WithLogger(logger.NewTestLogger()).
-				WithMetricsRecorder(recorder).
 				Build()
 			require.NoError(t, err)
 
-			handler := exec.CreateHandler()
+			handler := AlwaysAck(WithMetrics(exec.CreateHandler(), recorder, logger.NewTestLogger()))
 
 			evt := event.New()
 			evt.SetID("test-event-1")
@@ -901,11 +900,10 @@ func TestCreateHandler_MetricsRecording_Failed(t *testing.T) {
 		WithAPIClient(newMockAPIClient()).
 		WithTransportClient(k8sclient.NewMockK8sClient()).
 		WithLogger(logger.NewTestLogger()).
-		WithMetricsRecorder(recorder).
 		Build()
 	require.NoError(t, err)
 
-	handler := exec.CreateHandler()
+	handler := AlwaysAck(WithMetrics(exec.CreateHandler(), recorder, logger.NewTestLogger()))
 
 	evt := event.New()
 	evt.SetID("test-event-fail")
@@ -944,7 +942,7 @@ func TestCreateHandler_NilMetricsRecorder(t *testing.T) {
 		Build()
 	require.NoError(t, err)
 
-	handler := exec.CreateHandler()
+	handler := AlwaysAck(WithMetrics(exec.CreateHandler(), nil, logger.NewTestLogger()))
 
 	evt := event.New()
 	evt.SetID("test-event-nil")
@@ -955,6 +953,165 @@ func TestCreateHandler_NilMetricsRecorder(t *testing.T) {
 	assert.NotPanics(t, func() {
 		_ = handler(context.Background(), &evt)
 	}, "handler with nil MetricsRecorder should not panic")
+}
+
+// TestWithMetrics_RecordsMetrics verifies WithMetrics records the correct metric status
+// and passes the result through
+func TestWithMetrics_RecordsMetrics(t *testing.T) {
+	tests := []struct {
+		result          *ExecutionResult
+		name            string
+		expectedStatus  string
+		expectNoMetrics bool
+	}{
+		{
+			name:           "success",
+			result:         &ExecutionResult{Status: StatusSuccess},
+			expectedStatus: "success",
+		},
+		{
+			name:           "skipped",
+			result:         &ExecutionResult{Status: StatusSuccess, ResourcesSkipped: true},
+			expectedStatus: "skipped",
+		},
+		{
+			name: "failed",
+			result: &ExecutionResult{
+				Status: StatusFailed,
+				Errors: map[ExecutionPhase]error{PhaseParamExtraction: fmt.Errorf("error")},
+			},
+			expectedStatus: "failed",
+		},
+		{
+			name:            "nil result",
+			result:          nil,
+			expectNoMetrics: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			registry := prometheus.NewRegistry()
+			recorder := metrics.NewRecorder("test-adapter", "v0.1.0", registry)
+
+			inner := HandlerFunc(func(_ context.Context, _ *event.Event) (*ExecutionResult, error) {
+				return tt.result, nil
+			})
+			handler := WithMetrics(inner, recorder, logger.NewTestLogger())
+
+			evt := event.New()
+			evt.SetID("test-metrics-" + tt.name)
+			evt.SetType("com.hyperfleet.test")
+			evt.SetSource("test")
+
+			got, err := handler(context.Background(), &evt)
+			require.NoError(t, err)
+			assert.Equal(t, tt.result, got, "result must be passed through unchanged")
+
+			families, err := registry.Gather()
+			require.NoError(t, err)
+
+			if tt.expectNoMetrics {
+				assert.Nil(t, findFamily(families, "hyperfleet_adapter_events_processed_total"),
+					"no status counter should be recorded for nil result")
+				durationFamily := findFamily(families, "hyperfleet_adapter_event_processing_duration_seconds")
+				require.NotNil(t, durationFamily, "duration must be recorded even for nil result")
+				assert.Equal(t, uint64(1), durationFamily.GetMetric()[0].GetHistogram().GetSampleCount())
+				return
+			}
+
+			count := getCounterValue(t, families, "hyperfleet_adapter_events_processed_total", "status", tt.expectedStatus)
+			assert.Equal(t, float64(1), count)
+
+			durationFamily := findFamily(families, "hyperfleet_adapter_event_processing_duration_seconds")
+			require.NotNil(t, durationFamily)
+			assert.Equal(t, uint64(1), durationFamily.GetMetric()[0].GetHistogram().GetSampleCount())
+		})
+	}
+}
+
+// TestWithMetrics_HandlerPanicPropagates verifies a panic in handler is not swallowed by WithMetrics
+func TestWithMetrics_HandlerPanicPropagates(t *testing.T) {
+	inner := HandlerFunc(func(_ context.Context, _ *event.Event) (*ExecutionResult, error) {
+		panic("handler panic")
+	})
+
+	registry := prometheus.NewRegistry()
+	recorder := metrics.NewRecorder("test-adapter", "v0.1.0", registry)
+	handler := WithMetrics(inner, recorder, logger.NewTestLogger())
+
+	evt := event.New()
+	evt.SetID("test-handler-panic")
+	evt.SetType("com.hyperfleet.test")
+	evt.SetSource("test")
+
+	assert.Panics(t, func() {
+		_, _ = handler(context.Background(), &evt)
+	}, "panic in inner handler must propagate through WithMetrics")
+}
+
+// TestWithMetrics_MetricsPanicRecovered verifies that a panic inside metrics recording
+// is recovered
+func TestWithMetrics_MetricsPanicRecovered(t *testing.T) {
+	inner := HandlerFunc(func(_ context.Context, _ *event.Event) (*ExecutionResult, error) {
+		return &ExecutionResult{Status: StatusSuccess}, nil
+	})
+
+	// new(metrics.Recorder) bypasses the nil receiver guard but has nil internal
+	// fields, causing panic inside recordMetrics
+	panicRecorder := new(metrics.Recorder)
+	handler := WithMetrics(inner, panicRecorder, logger.NewTestLogger())
+
+	evt := event.New()
+	evt.SetID("test-metrics-panic")
+	evt.SetType("com.hyperfleet.test")
+	evt.SetSource("test")
+
+	var got *ExecutionResult
+	assert.NotPanics(t, func() {
+		got, _ = handler(context.Background(), &evt)
+	}, "panic in metrics recording must be recovered by WithMetrics")
+	assert.NotNil(t, got, "result must still be returned after metrics panic")
+}
+
+// TestAlwaysAck_AlwaysReturnsNil verifies AlwaysAck always returns nil
+func TestAlwaysAck_AlwaysReturnsNil(t *testing.T) {
+	tests := []struct {
+		result *ExecutionResult
+		err    error
+		name   string
+	}{
+		{
+			name:   "success result",
+			result: &ExecutionResult{Status: StatusSuccess},
+		},
+		{
+			name:   "failed result",
+			result: &ExecutionResult{Status: StatusFailed},
+		},
+		{
+			name: "error from inner handler",
+			err:  fmt.Errorf("inner handler error"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			inner := HandlerFunc(func(_ context.Context, _ *event.Event) (*ExecutionResult, error) {
+				return tt.result, tt.err
+			})
+
+			handler := AlwaysAck(inner)
+
+			evt := event.New()
+			evt.SetID("test-ack")
+			evt.SetType("com.hyperfleet.test")
+			evt.SetSource("test")
+
+			err := handler(context.Background(), &evt)
+			assert.Nil(t, err, "AlwaysAck must always return nil")
+		})
+	}
 }
 
 // TestPreconditionAPIFailure_ExecutionStatusRemainsFailed verifies that when a precondition

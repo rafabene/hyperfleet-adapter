@@ -383,14 +383,12 @@ func buildExecutor(
 	apiClient hyperfleetapi.Client,
 	tc transportclient.TransportClient,
 	log logger.Logger,
-	recorder *metrics.Recorder,
 ) (*executor.Executor, error) {
 	return executor.NewBuilder().
 		WithConfig(config).
 		WithAPIClient(apiClient).
 		WithTransportClient(tc).
 		WithLogger(log).
-		WithMetricsRecorder(recorder).
 		Build()
 }
 
@@ -521,7 +519,7 @@ func runServe(flags *pflag.FlagSet) error {
 
 	// Build executor
 	log.Info(ctx, "Creating event executor...")
-	exec, err := buildExecutor(config, apiClient, tc, log, metricsRecorder)
+	exec, err := buildExecutor(config, apiClient, tc, log)
 	if err != nil {
 		errCtx := logger.WithErrorField(ctx, err)
 		log.Errorf(errCtx, "Failed to create executor")
@@ -529,7 +527,7 @@ func runServe(flags *pflag.FlagSet) error {
 	}
 
 	// Create the event handler and subscribe to broker
-	handler := exec.CreateHandler()
+	handler := executor.AlwaysAck(executor.WithMetrics(exec.CreateHandler(), metricsRecorder, log))
 
 	// Handle signals for graceful shutdown
 	sigCh := make(chan os.Signal, 1)
@@ -708,7 +706,7 @@ func runDryRun(flags *pflag.FlagSet) error {
 	}
 
 	// Build executor with mock clients (same builder as serve, no metrics in dry-run)
-	exec, err := buildExecutor(config, dryrunAPI, dryrunClient, log, nil)
+	exec, err := buildExecutor(config, dryrunAPI, dryrunClient, log)
 	if err != nil {
 		return fmt.Errorf("failed to create executor: %w", err)
 	}

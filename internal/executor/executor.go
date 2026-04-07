@@ -7,14 +7,11 @@ import (
 	"reflect"
 	"strings"
 
-	"time"
-
 	"github.com/cloudevents/sdk-go/v2/event"
 	"github.com/openshift-hyperfleet/hyperfleet-adapter/internal/configloader"
 	"github.com/openshift-hyperfleet/hyperfleet-adapter/internal/hyperfleetapi"
 	"github.com/openshift-hyperfleet/hyperfleet-adapter/internal/transportclient"
 	"github.com/openshift-hyperfleet/hyperfleet-adapter/pkg/logger"
-	"github.com/openshift-hyperfleet/hyperfleet-adapter/pkg/metrics"
 	pkgotel "github.com/openshift-hyperfleet/hyperfleet-adapter/pkg/otel"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/trace"
@@ -256,14 +253,9 @@ func (e *Executor) startTracedExecution(ctx context.Context) (context.Context, t
 	return ctx, span
 }
 
-// CreateHandler creates an event handler function that can be used with the broker subscriber
-// This is a convenience method for integrating with the broker_consumer package
-//
-// Error handling strategy:
-// - All failures are logged but the message is ACKed (return nil)
-// - This prevents infinite retry loops for non-recoverable errors (e.g., 400 Bad Request, invalid data)
-func (e *Executor) CreateHandler() func(ctx context.Context, evt *event.Event) error {
-	return func(ctx context.Context, evt *event.Event) error {
+// CreateHandler creates a HandlerFunc that executes the adapter task for a given CloudEvent
+func (e *Executor) CreateHandler() HandlerFunc {
+	return func(ctx context.Context, evt *event.Event) (*ExecutionResult, error) {
 		// Add event ID to context for logging correlation
 		ctx = logger.WithEventID(ctx, evt.ID())
 
@@ -276,38 +268,12 @@ func (e *Executor) CreateHandler() func(ctx context.Context, evt *event.Event) e
 		e.log.Infof(ctx, "Event received: id=%s type=%s source=%s time=%s",
 			evt.ID(), evt.Type(), evt.Source(), evt.Time())
 
-		start := time.Now()
 		result := e.Execute(ctx, evt.Data())
-		duration := time.Since(start)
-
-		e.recordMetrics(result, duration)
 
 		e.log.Infof(ctx, "Event processed: type=%s source=%s time=%s",
 			evt.Type(), evt.Source(), evt.Time())
 
-		return nil
-	}
-}
-
-// recordMetrics records Prometheus metrics based on the execution result.
-func (e *Executor) recordMetrics(result *ExecutionResult, duration time.Duration) {
-	recorder := e.config.MetricsRecorder
-	if recorder == nil {
-		return
-	}
-
-	recorder.ObserveProcessingDuration(duration)
-
-	switch {
-	case result.Status == StatusFailed:
-		recorder.RecordEventProcessed("failed")
-		for phase := range result.Errors {
-			recorder.RecordError(string(phase))
-		}
-	case result.ResourcesSkipped:
-		recorder.RecordEventProcessed("skipped")
-	default:
-		recorder.RecordEventProcessed("success")
+		return result, nil
 	}
 }
 
@@ -390,12 +356,6 @@ func (b *ExecutorBuilder) WithTransportClient(client transportclient.TransportCl
 // WithLogger sets the logger
 func (b *ExecutorBuilder) WithLogger(log logger.Logger) *ExecutorBuilder {
 	b.config.Logger = log
-	return b
-}
-
-// WithMetricsRecorder sets the Prometheus metrics recorder
-func (b *ExecutorBuilder) WithMetricsRecorder(recorder *metrics.Recorder) *ExecutorBuilder {
-	b.config.MetricsRecorder = recorder
 	return b
 }
 
